@@ -1,0 +1,115 @@
+#analysis-panel {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+  text-align: left;
+}
+
+#analysis-panel h2 {
+  font-size: 1.25rem;
+  margin: 0 0 16px;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.controls button {
+  padding: 8px 18px;
+  border-radius: 8px;
+  border: 1px solid #646cff;
+  background: #646cff;
+  color: #fff;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.controls .cancel-btn {
+  background: #e05252;
+  border-color: #e05252;
+}
+
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.mode-hint {
+  font-size: 0.8rem;
+  opacity: 0.75;
+}
+
+.progress {
+  margin-top: 16px;
+  height: 10px;
+  border-radius: 6px;
+  background: rgba(128, 128, 128, 0.25);
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: #646cff;
+  transition: width 80ms linear;
+}
+
+.phase-line {
+  margin: 8px 0 12px;
+  font-size: 0.85rem;
+  opacity: 0.85;
+}
+
+.stats {
+  font-size: 0.85rem;
+}
+
+.stats-line {
+  margin: 0 0 8px;
+}
+
+.slowest-list {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  columns: 2;
+}
+
+.result-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.result-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 90px;
+  gap: 8px;
+  padding: 2px 8px;
+  /* 500 行流式渲染：跳过屏外行的布局/绘制，保证滚动与更新不卡 */
+  content-visibility: auto;
+  contain-intrinsic-size: 24px;
+}
+
+.result-done .result-status {
+  color: #3aa55d;
+}
+
+.result-error .result-status {
+  color: #e05252;
+}
+
+.result-pending {
+  opacity: 0.4;
+}
+
+.result-ms {
+  text-align: right;
+}
