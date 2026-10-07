@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "selftest:node": "node --experimental-strip-types --loader ./selftest/ts-loader.mjs selftest/node-selftest.mts",
+    "selftest:browser": "npm run build && node selftest/browser-cdp.mjs"
   },
   "dependencies": {
     "react": "^19.3.0",

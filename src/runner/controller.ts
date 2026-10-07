@@ -1,16 +1,20 @@
 /**
- * 批次调度（设计文档 §1.2 / §2.2 / §5 / §6）：
+ * 批次调度入口（设计文档 §1.2 / §2.2 / §5 / §6；本轮扩展暂停/恢复/重新开始）：
  * - 动态 pull 分发：Worker 完成一个领一个；队列按预估耗时降序（R4 长尾先入队）
- * - 取消：terminate 硬取消 + 惰性重建 + batchId 世代校验
+ * - 暂停 = 停止派发新任务，在途跑完照常入库；恢复 = 断点续跑，不重跑已完成
+ * - 取消/重新开始：terminate 硬取消 + batchId 世代校验丢弃旧批次消息（§5.2）；
+ *   “重新开始”在取消语义后立刻发起新批次，新旧世代隔离、消息互不污染
  * - 降级：Worker / 模块 Worker 不可用 → 主线程任务间切片
  * - 批次结束（含取消）即 terminate 全池，防 Worker 内存膨胀（R1）
  */
-import { taskDescriptors, TASK_COUNT } from '../tasks/registry'
+import { taskDescriptors } from '../tasks/registry'
 import type { TaskDescriptor } from '../tasks/registry'
-import { acquirePool, terminatePool } from '../workers/pool'
-import type { ResultMessage, TaskMessage } from '../workers/analysis.worker'
+import { getInitialPoolSize, realWorkerFactory } from '../workers/pool'
+import type { WorkerFactory } from '../workers/pool'
 import * as store from '../store/analysisStore'
 import { runMainThreadBatch } from './mainThreadRunner'
+import { BatchRunner } from './batchScheduler'
+import type { BatchRunOptions } from './batchScheduler'
 
 /** §6.2：模块 Worker 特性检测（data: URL 空 Worker 构造即检测，随即 terminate） */
 function supportsModuleWorkers(): boolean {
@@ -35,85 +39,90 @@ export function selectBackend(): store.Backend {
   return supportsModuleWorkers() ? 'worker-pool' : 'main-thread'
 }
 
-/** 长任务按预估耗时降序入队（R4：压缩尾部拖尾） */
-function buildQueue(): TaskDescriptor[] {
-  return [...taskDescriptors].sort((a, b) => b.params.targetMs - a.params.targetMs)
+/** 长任务按预估耗时降序入队（R4：压缩尾部拖尾）；extraTasks 置于最前优先执行 */
+function buildQueue(
+  extraTasks: readonly TaskDescriptor[] = [],
+  base: readonly TaskDescriptor[] = taskDescriptors,
+): TaskDescriptor[] {
+  const regular = [...base].sort(
+    (a, b) => b.params.targetMs - a.params.targetMs,
+  )
+  return [...extraTasks, ...regular]
 }
 
-export function startAnalysis(): void {
-  // R5：幂等——运行中重复触发（含 StrictMode 场景）不发起第二批
-  if (store.getSnapshot().status === 'running') return
+/** 批次配置（自测注入：僵死任务 / 传输层 / 定时参数），生产路径均走默认值 */
+export interface StartOptions {
+  extraTasks?: readonly TaskDescriptor[]
+  factory?: WorkerFactory
+  timing?: BatchRunOptions
+  /** 自测用：只取常规任务集前 N 个（默认全部 500） */
+  limit?: number
+}
 
-  const backend = selectBackend()
-  const batchId = store.beginBatch(backend, TASK_COUNT)
-  const queue = buildQueue()
+let activeRunner: BatchRunner | null = null
+
+function startBatch(options: StartOptions = {}): void {
+  const backend = options.factory !== undefined ? 'worker-pool' : selectBackend()
+  const base =
+    options.limit !== undefined ? taskDescriptors.slice(0, options.limit) : taskDescriptors
+  const queue = buildQueue(options.extraTasks, base)
+  const initialPoolSize = options.timing?.initialPoolSize ?? getInitialPoolSize()
+  const batchId = store.beginBatch(backend, queue.length, initialPoolSize)
 
   if (backend === 'main-thread') {
     void runMainThreadBatch(batchId, queue)
     return
   }
-  runWorkerBatch(batchId, queue)
+
+  const runner = new BatchRunner(batchId, queue, options.factory ?? realWorkerFactory, {
+    initialPoolSize,
+    ...options.timing,
+  }, (failedBatchId, remaining) => {
+    // §6.1：池内 Worker 全部故障 → 剩余任务交主线程任务间切片跑完（同一 store 协议）
+    if (failedBatchId !== store.getSnapshot().batchId) return
+    void runMainThreadBatch(failedBatchId, remaining)
+  })
+  activeRunner = runner
+  runner.start()
 }
 
-export function cancelAnalysis(): void {
+/** 开始分析（idle/done/cancelled 态可用） */
+export function startAnalysis(options?: StartOptions): void {
+  const status = store.getSnapshot().status
+  if (status === 'running' || status === 'paused') return
+  startBatch(options)
+}
+
+/** 暂停：只关派发闸口，不 terminate；在途任务跑完照常入库 */
+export function pauseAnalysis(): void {
   if (store.getSnapshot().status !== 'running') return
-  // 先翻世代/清缓冲，再硬杀 Worker；旧批次迟到消息由 store 入口丢弃（§5.2）
-  store.cancelBatch()
-  terminatePool()
+  store.pauseBatch()
 }
 
-function runWorkerBatch(batchId: number, queue: TaskDescriptor[]): void {
-  const workers = acquirePool()
-  const inFlight = new Map<Worker, TaskDescriptor>()
-  let activeWorkers = 0
+/** 恢复：开闸并通知调度器立即补派发；已完成任务不在队列，天然不重跑 */
+export function resumeAnalysis(): void {
+  if (store.getSnapshot().status !== 'paused') return
+  store.resumeBatch()
+  activeRunner?.resume()
+}
 
-  const maybeFinish = (): void => {
-    if (queue.length === 0 && inFlight.size === 0) {
-      store.completeBatch(batchId)
-      // R1：批次结束 terminate 全池，下一批惰性重建
-      terminatePool()
-    }
-  }
+/** 取消：硬终止当前批次（running / paused 均可） */
+export function cancelAnalysis(): void {
+  const status = store.getSnapshot().status
+  if (status !== 'running' && status !== 'paused') return
+  activeRunner?.cancel()
+  activeRunner = null
+  store.cancelBatch()
+}
 
-  const dispatch = (worker: Worker): void => {
-    const task = queue.shift()
-    if (!task || !store.isCurrentBatch(batchId)) {
-      if (task) queue.unshift(task)
-      maybeFinish()
-      return
-    }
-    inFlight.set(worker, task)
-    const msg: TaskMessage = { taskId: task.taskId, params: task.params, batchId }
-    worker.postMessage(msg)
+/**
+ * 重新开始：旧批次按现有取消语义安全终止（terminate + 世代号自增），
+ * 旧 Worker 的迟到消息因 batchId 不匹配在 store 入口丢弃，新批次不受污染。
+ */
+export function restartAnalysis(options?: StartOptions): void {
+  const status = store.getSnapshot().status
+  if (status === 'running' || status === 'paused') {
+    cancelAnalysis()
   }
-
-  for (const worker of workers) {
-    activeWorkers += 1
-    worker.onmessage = (e: MessageEvent<ResultMessage>) => {
-      const { batchId: msgBatchId, result } = e.data
-      inFlight.delete(worker)
-      // 世代校验在 store 入口再兜一层（双保险，§5.2）
-      store.receiveResult(msgBatchId, result)
-      if (store.isCurrentBatch(batchId)) {
-        dispatch(worker)
-      } else {
-        maybeFinish()
-      }
-    }
-    worker.onerror = () => {
-      // 容错：在途任务重新入队，剔除故障 Worker；池空则降级主线程跑完余量
-      const pending = inFlight.get(worker)
-      if (pending) queue.unshift(pending)
-      inFlight.delete(worker)
-      worker.onmessage = null
-      worker.onerror = null
-      worker.terminate()
-      activeWorkers -= 1
-      if (activeWorkers === 0 && store.isCurrentBatch(batchId)) {
-        terminatePool()
-        void runMainThreadBatch(batchId, queue)
-      }
-    }
-    dispatch(worker)
-  }
+  startBatch(options)
 }

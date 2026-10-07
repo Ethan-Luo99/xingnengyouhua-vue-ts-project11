@@ -20,6 +20,11 @@ export interface TaskParams {
   targetMs: number
   /** 每个任务独立的确定性种子，驱动计算内容，防止结果被编译器优化掉 */
   seed: number
+  /**
+   * 可选：任务将忙等到该时长才返回（> targetMs 时用于模拟僵死）。
+   * 由批次配置按需注入，常规批次不带该字段。
+   */
+  hangMs?: number
 }
 
 export interface TaskResult {
@@ -28,6 +33,10 @@ export interface TaskResult {
   checksum: number
   /** 实测耗时（ms） */
   actualMs: number
+  /** true = 看门狗二次僵死后标记的失败结果（error 状态，结果列表可见） */
+  error?: boolean
+  /** 失败原因（error=true 时存在） */
+  errorMessage?: string
 }
 
 export type TaskFn = (params: TaskParams) => TaskResult
@@ -81,15 +90,27 @@ function generateTasks(): TaskDescriptor[] {
 /** 全部任务描述（生成顺序）；入队前由调度方按 targetMs 降序重排（文档 R4） */
 export const taskDescriptors: readonly TaskDescriptor[] = generateTasks()
 
+/** 僵死注入任务的固定 id（任务集之外的额外任务，供看门狗端到端自测使用） */
+export const ZOMBIE_TASK_ID = 'task-zombie'
+
+/** 构造一个僵死任务：预估耗时按 targetMs，但实际忙等到 hangMs */
+export function makeZombieTask(targetMs: number, hangMs: number): TaskDescriptor {
+  return {
+    taskId: ZOMBIE_TASK_ID,
+    params: { targetMs, seed: 0x5ead0000, hangMs },
+  }
+}
+
 /**
  * 任务本体：忙等 targetMs，期间做确定性浮点运算。
  * 用 performance.now() 控制时长，保证分布在任意算力机器上一致。
  */
 function computeTask(taskId: string, params: TaskParams): TaskResult {
   const start = performance.now()
+  const runMs = Math.max(params.targetMs, params.hangMs ?? 0)
   let acc = params.seed % 1000
   let iter = params.seed >>> 8
-  while (performance.now() - start < params.targetMs) {
+  while (performance.now() - start < runMs) {
     // 一轮混合运算，结果回灌 acc，防止循环被优化为空转
     acc = (acc * 1.0000001 + Math.sin(iter) * Math.cos(acc)) % 1e9
     iter = (iter * 1664525 + 1013904223) >>> 0
@@ -102,6 +123,28 @@ function computeTask(taskId: string, params: TaskParams): TaskResult {
 }
 
 /** 注册表：{ [taskId]: (params) => result }，主线程与 Worker 共用 */
-export const taskRegistry: Record<string, TaskFn> = Object.fromEntries(
+const taskRegistry: Record<string, TaskFn> = Object.fromEntries(
   taskDescriptors.map((d) => [d.taskId, (params: TaskParams) => computeTask(d.taskId, params)]),
 )
+
+taskRegistry[ZOMBIE_TASK_ID] = (params: TaskParams) => computeTask(ZOMBIE_TASK_ID, params)
+
+/**
+ * 合成任务回退：自测/看门狗场景会使用任务集之外的任意 taskId
+ * （参数已携带全部运行信息）。生产任务 id 全部静态存在于注册表中，
+ * 此回退不会改变生产路径行为。
+ */
+const registryWithFallback: Record<string, TaskFn> = new Proxy(taskRegistry, {
+  get(target, property, receiver) {
+    if (typeof property === 'string' && !(property in target)) {
+      return (params: TaskParams) => computeTask(property, params)
+    }
+    return Reflect.get(target, property, receiver)
+  },
+  has(target, property) {
+    if (typeof property === 'string' && !(property in target)) return true
+    return Reflect.has(target, property)
+  },
+})
+
+export { registryWithFallback as taskRegistry }
