@@ -20,6 +20,11 @@ export interface TaskParams {
   targetMs: number
   /** 每个任务独立的确定性种子，驱动计算内容，防止结果被编译器优化掉 */
   seed: number
+  /**
+   * 测试专用：在 targetMs 之外额外忙等的时长（ms），用于构造
+   * "实际耗时远超预估"的僵死任务以验收看门狗；正常 500 任务均不设置。
+   */
+  extraBusyMs?: number
 }
 
 export interface TaskResult {
@@ -29,6 +34,24 @@ export interface TaskResult {
   /** 实测耗时（ms） */
   actualMs: number
 }
+
+/**
+ * 任务最终失败（看门狗二次僵死后由主线程合成，见 controller 看门狗逻辑）。
+ * status: 'error' 的条目与成功结果一样进入结果列表，批次继续直至完成。
+ */
+export interface TaskFailure {
+  taskId: string
+  status: 'error'
+  /** 失败原因 */
+  error: string
+  /** 已重试次数（二次僵死 => 1） */
+  attempts: number
+  /** 合成时刻的耗时记录（ms），仅用于展示 */
+  elapsedMs: number
+}
+
+/** 结果列表条目：成功结果或失败结果（成功结果不携带 status，保持原协议不变） */
+export type TaskOutcome = TaskResult | TaskFailure
 
 export type TaskFn = (params: TaskParams) => TaskResult
 
@@ -87,9 +110,10 @@ export const taskDescriptors: readonly TaskDescriptor[] = generateTasks()
  */
 function computeTask(taskId: string, params: TaskParams): TaskResult {
   const start = performance.now()
+  const totalMs = params.targetMs + (params.extraBusyMs ?? 0)
   let acc = params.seed % 1000
   let iter = params.seed >>> 8
-  while (performance.now() - start < params.targetMs) {
+  while (performance.now() - start < totalMs) {
     // 一轮混合运算，结果回灌 acc，防止循环被优化为空转
     acc = (acc * 1.0000001 + Math.sin(iter) * Math.cos(acc)) % 1e9
     iter = (iter * 1664525 + 1013904223) >>> 0
@@ -105,3 +129,14 @@ function computeTask(taskId: string, params: TaskParams): TaskResult {
 export const taskRegistry: Record<string, TaskFn> = Object.fromEntries(
   taskDescriptors.map((d) => [d.taskId, (params: TaskParams) => computeTask(d.taskId, params)]),
 )
+
+/**
+ * dev 自测任务注册入口（仅 dev 测试模块调用；注册进同一份共享注册表，
+ * 保证 Worker 侧也能查到测试 taskId）。
+ */
+export function registerDevTask(taskId: string, params: TaskParams): void {
+  if (taskRegistry[taskId]) return
+  taskRegistry[taskId] = (incoming: TaskParams) =>
+    computeTask(taskId, { ...params, ...incoming })
+}
+

@@ -1,15 +1,14 @@
 /**
- * 批次调度（设计文档 §1.2 / §2.2 / §5 / §6）：
- * - 动态 pull 分发：Worker 完成一个领一个；队列按预估耗时降序（R4 长尾先入队）
- * - 取消：terminate 硬取消 + 惰性重建 + batchId 世代校验
- * - 降级：Worker / 模块 Worker 不可用 → 主线程任务间切片
- * - 批次结束（含取消）即 terminate 全池，防 Worker 内存膨胀（R1）
+ * 批次生命周期入口（设计文档 §1.2 / §2.2 / §5 / §6）：
+ * - 开始 / 暂停 / 恢复 / 取消 / 重新开始
+ * - 取消走 terminate 硬取消 + batchId 世代校验（§5.1/§5.2），旧批次消息不污染新批次
+ * - Worker / 模块 Worker 不可用 -> 主线程任务间切片降级（§6.1）
+ * - 运行逻辑见 BatchRunner；本文件只做后端选择、世代切换与降级接线
  */
-import { taskDescriptors, TASK_COUNT } from '../tasks/registry'
+import { taskDescriptors } from '../tasks/registry'
 import type { TaskDescriptor } from '../tasks/registry'
-import { acquirePool, terminatePool } from '../workers/pool'
-import type { ResultMessage, TaskMessage } from '../workers/analysis.worker'
 import * as store from '../store/analysisStore'
+import { BatchRunner } from './batchRunner'
 import { runMainThreadBatch } from './mainThreadRunner'
 
 /** §6.2：模块 Worker 特性检测（data: URL 空 Worker 构造即检测，随即 terminate） */
@@ -40,80 +39,84 @@ function buildQueue(): TaskDescriptor[] {
   return [...taskDescriptors].sort((a, b) => b.params.targetMs - a.params.targetMs)
 }
 
-export function startAnalysis(): void {
-  // R5：幂等——运行中重复触发（含 StrictMode 场景）不发起第二批
-  if (store.getSnapshot().status === 'running') return
+export interface StartOptions {
+  queue?: readonly TaskDescriptor[]
+  initialPoolSize?: number
+  autoScale?: boolean
+}
+
+let activeRunner: BatchRunner | null = null
+let activeBatchId = 0
+
+/** R5：幂等——运行/暂停中重复触发不另起批次 */
+export function startAnalysis(options: StartOptions = {}): void {
+  const status = store.getSnapshot().status
+  if (status === 'running' || status === 'paused') return
 
   const backend = selectBackend()
-  const batchId = store.beginBatch(backend, TASK_COUNT)
-  const queue = buildQueue()
+  const queue = options.queue ? [...options.queue] : buildQueue()
+  const total = queue.length
+  const batchId = store.beginBatch(backend, total, options.initialPoolSize ?? 0)
+  activeBatchId = batchId
 
   if (backend === 'main-thread') {
+    activeRunner = null
     void runMainThreadBatch(batchId, queue)
     return
   }
-  runWorkerBatch(batchId, queue)
+
+  const runner = new BatchRunner(batchId, queue, {
+    initialSize: options.initialPoolSize,
+    autoScale: options.autoScale,
+  })
+  activeRunner = runner
+  // 全池故障 -> 主线程跑完剩余任务（既有降级语义）
+  runner.failOverToMainThread = () => {
+    const remaining = runner.takeRemainingQueue()
+    void runMainThreadBatch(batchId, remaining)
+  }
+  runner.start()
+}
+
+export function pauseAnalysis(): void {
+  activeRunner?.pause()
+}
+
+export function resumeAnalysis(): void {
+  activeRunner?.resume()
 }
 
 export function cancelAnalysis(): void {
-  if (store.getSnapshot().status !== 'running') return
-  // 先翻世代/清缓冲，再硬杀 Worker；旧批次迟到消息由 store 入口丢弃（§5.2）
+  const status = store.getSnapshot().status
+  if (status !== 'running' && status !== 'paused') return
+  // 先解绑 runner，再翻世代，最后 terminate：旧批次迟到消息由 store 入口丢弃（§5.2）
+  const runner = activeRunner
+  activeRunner = null
   store.cancelBatch()
-  terminatePool()
+  runner?.cancel()
 }
 
-function runWorkerBatch(batchId: number, queue: TaskDescriptor[]): void {
-  const workers = acquirePool()
-  const inFlight = new Map<Worker, TaskDescriptor>()
-  let activeWorkers = 0
+/**
+ * 暂停/运行中"重新开始"：按现有取消语义安全终止旧批次，再发起新批次。
+ * 新批次 batchId 自增，旧 Worker 全部 terminate，旧批次消息不可能污染新批次。
+ */
+export function restartAnalysis(options: StartOptions = {}): void {
+  cancelAnalysis()
+  startAnalysis(options)
+}
 
-  const maybeFinish = (): void => {
-    if (queue.length === 0 && inFlight.size === 0) {
-      store.completeBatch(batchId)
-      // R1：批次结束 terminate 全池，下一批惰性重建
-      terminatePool()
-    }
-  }
+export function getActiveBatchId(): number {
+  return activeBatchId
+}
 
-  const dispatch = (worker: Worker): void => {
-    const task = queue.shift()
-    if (!task || !store.isCurrentBatch(batchId)) {
-      if (task) queue.unshift(task)
-      maybeFinish()
-      return
-    }
-    inFlight.set(worker, task)
-    const msg: TaskMessage = { taskId: task.taskId, params: task.params, batchId }
-    worker.postMessage(msg)
-  }
+export function getActiveRunner(): BatchRunner | null {
+  return activeRunner
+}
 
-  for (const worker of workers) {
-    activeWorkers += 1
-    worker.onmessage = (e: MessageEvent<ResultMessage>) => {
-      const { batchId: msgBatchId, result } = e.data
-      inFlight.delete(worker)
-      // 世代校验在 store 入口再兜一层（双保险，§5.2）
-      store.receiveResult(msgBatchId, result)
-      if (store.isCurrentBatch(batchId)) {
-        dispatch(worker)
-      } else {
-        maybeFinish()
-      }
-    }
-    worker.onerror = () => {
-      // 容错：在途任务重新入队，剔除故障 Worker；池空则降级主线程跑完余量
-      const pending = inFlight.get(worker)
-      if (pending) queue.unshift(pending)
-      inFlight.delete(worker)
-      worker.onmessage = null
-      worker.onerror = null
-      worker.terminate()
-      activeWorkers -= 1
-      if (activeWorkers === 0 && store.isCurrentBatch(batchId)) {
-        terminatePool()
-        void runMainThreadBatch(batchId, queue)
-      }
-    }
-    dispatch(worker)
-  }
+// R2：HMR 时 terminate 当前批次池，防止旧 Worker 泄漏累积
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    activeRunner?.cancel()
+    activeRunner = null
+  })
 }

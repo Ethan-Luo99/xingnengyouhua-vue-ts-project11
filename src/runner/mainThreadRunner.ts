@@ -25,9 +25,13 @@ export async function runMainThreadBatch(
 ): Promise<void> {
   for (const task of queue) {
     // 取消检查：任务间让出 + 执行前各查一次世代
-    if (!store.isCurrentBatch(batchId)) return
+    if (!store.isBatchAlive(batchId)) return
     await yieldToMain()
-    if (!store.isCurrentBatch(batchId)) return
+    // 暂停：在途任务语义在此路径为"当前尚未开始的任务"，等待恢复或取消
+    while (store.getSnapshot().batchId === batchId && store.getSnapshot().status === 'paused') {
+      await yieldToMain()
+    }
+    if (!store.isBatchAlive(batchId)) return
     const result = taskRegistry[task.taskId](task.params)
     store.receiveResult(batchId, result)
   }
